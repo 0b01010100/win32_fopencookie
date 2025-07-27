@@ -1,4 +1,5 @@
 build/
-minhook/
+bin/Debug/
+bin/
 .vscode/
 .cache/
