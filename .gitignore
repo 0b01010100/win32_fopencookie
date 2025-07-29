@@ -1,5 +1,5 @@
 build/
-bin/Debug/
 bin/
+bin/Debug/
 .vscode/
 .cache/

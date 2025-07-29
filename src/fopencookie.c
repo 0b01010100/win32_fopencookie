@@ -7,18 +7,22 @@
 #include <winternl.h>
 #include <MinHook.h>
 #include <myglib.h>
+#include <fcntl.h>
+#include <io.h>
 
-typedef struct _IO_cookie_t {
+typedef struct cookie_t 
+{
     void *cookie;
     cookie_io_functions_t  funcs;
+    long position;
+    unsigned int flags;
     int eof_flag;
     int error_flag;
-    long position;
-} _IO_cookie_t;
+} cookie_t;
 
 #define MAX_HANDLES 256
 static FILE* trackedHandles[MAX_HANDLES] = {0};
-static _IO_cookie_t* cookieData[MAX_HANDLES] = {0};
+static cookie_t* cookieData[MAX_HANDLES] = {0};
 static int cookieCount = 0;
 static int hooks_initialized = 0;
 
@@ -33,7 +37,7 @@ void init_mutex() {
     }
 }
 
-void register_cookie(_IO_cookie_t* cd, FILE* file) {
+void register_cookie(cookie_t* cd, FILE* file) {
     init_mutex();
     EnterCriticalSection(&cookie_mutex);
     
@@ -46,7 +50,7 @@ void register_cookie(_IO_cookie_t* cd, FILE* file) {
     LeaveCriticalSection(&cookie_mutex);
 }
 
-_IO_cookie_t* find_cookie(FILE* f) {
+cookie_t* find_cookie(FILE* f) {
     init_mutex();
     EnterCriticalSection(&cookie_mutex);
     
@@ -81,30 +85,31 @@ void remove_cookie(FILE* f) {
 }
 
 // Original function pointers
-typeof(&fread) originalfread = NULL;
-typeof(&fwrite) originalfwrite = NULL;
-typeof(&fseek) originalfseek = NULL;
-typeof(&ftell) originalftell = NULL;
-typeof(&fclose) originalfclose = NULL;
-typeof(&fgetc) originalfgetc = NULL;
-typeof(&fputc) originalfputc = NULL;
-typeof(&fputs) originalfputs = NULL;
-typeof(&fgets) originalfgets = NULL;
-//typeof(&fprintf) originalfprintf = NULL; 
-typeof(&fscanf) originalfscanf = NULL;
-typeof(&fflush) originalfflush = NULL;
-typeof(&feof) originalfeof = NULL;
-typeof(&ferror) originalferror = NULL;
-typeof(&clearerr) originalclearerr = NULL;
-typeof(&rewind) originalrewind = NULL;
-typeof(&fsetpos) originalfsetpos = NULL;
-typeof(&fgetpos) originalfgetpos = NULL;
-typeof(&ungetc) originalungetc = NULL;
+ 
+static size_t (*original_fread)(void *, size_t, size_t, FILE *) = NULL;
+static size_t (*original_fwrite)(const void *, size_t, size_t, FILE *) = NULL;
+static int (*original_fseek)(FILE *, long, int) = NULL;
+static long (*original_ftell)(FILE *) = NULL;
+static int (*original_fclose)(FILE *) = NULL;
+static int (*original_fgetc)(FILE *) = NULL;
+static int (*original_fputc)(int, FILE *) = NULL;
+static int (*original_fputs)(const char *, FILE *) = NULL;
+static char *(*original_fgets)(char *, int, FILE *) = NULL;
+static int (*original_fscanf)(FILE *, const char *, ...) = NULL;
+static int (*original_fflush)(FILE *) = NULL;
+static int (*original_feof)(FILE *) = NULL;
+static int (*original_ferror)(FILE *) = NULL;
+static void (*original_clearerr)(FILE *) = NULL;
+static void (*original_rewind)(FILE *) = NULL;
+static int (*original_fsetpos)(FILE *, const fpos_t *) = NULL;
+static int (*original_fgetpos)(FILE *, fpos_t *) = NULL;
+static int (*original_ungetc)(int, FILE *) = NULL;
+
 
 // stdio overrides
 
 size_t fread_override(void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fread);
@@ -118,20 +123,20 @@ size_t fread_override(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     }
     
     size_t total_size = size * nmemb;
-    size_t bytes_read = cookie->funcs.read(cookie->cookie, ptr, total_size);
-    
-    if (bytes_read == 0) {
-        cookie->eof_flag = 1;
-    } else if (bytes_read < total_size) {
-        cookie->eof_flag = 1;
+    if (total_size / size != nmemb) {
+        errno = EOVERFLOW;
+        cookie->error_flag = 1;
+        return 0;
     }
     
+    size_t bytes_read = cookie->funcs.read(cookie->cookie, (char*)ptr, total_size);
+    
     cookie->position += bytes_read;
-    return bytes_read / size;
+    return (size_t)bytes_read / size;
 }
 
 size_t fwrite_override(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fwrite);
@@ -145,18 +150,27 @@ size_t fwrite_override(const void *ptr, size_t size, size_t nmemb, FILE *stream)
     }
     
     size_t total_size = size * nmemb;
-    size_t bytes_written = cookie->funcs.write(cookie->cookie, ptr, total_size);
+    if (total_size / size != nmemb) { // Check for overflow
+        errno = EOVERFLOW;
+        cookie->error_flag = 1;
+        return 0;
+    }
     
-    // if (bytes_written < total_size) {
-    //     cookie->error_flag = 1;
-    // }
+    size_t bytes_written = 0;
+    if (cookie->funcs.write) {
+        bytes_written = cookie->funcs.write(cookie->cookie, (const char*)ptr, total_size);
+        if (bytes_written < 0) {
+            cookie->error_flag = 1;
+            return 0;
+        }
+        cookie->position += bytes_written;
+    }
     
-    cookie->position += bytes_written;
-    return bytes_written / size;
+    return (size_t)bytes_written / size;
 }
 
 int fseek_override(FILE *stream, long offset, int whence) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fseek);
@@ -165,8 +179,13 @@ int fseek_override(FILE *stream, long offset, int whence) {
         return result;
     }
     
+    if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END) {
+        errno = EINVAL;
+        return -1;
+    }
+
     long new_offset = offset;
-    int result = cookie->funcs.seek(cookie->cookie, new_offset, whence);
+    int result = cookie->funcs.seek(cookie->cookie, &new_offset, whence);
     
     if (result == 0) {
         cookie->position = new_offset;
@@ -177,7 +196,7 @@ int fseek_override(FILE *stream, long offset, int whence) {
 }
 
 long ftell_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&ftell);
@@ -190,7 +209,7 @@ long ftell_override(FILE *stream) {
 }
 
 int fclose_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fclose);
@@ -207,7 +226,7 @@ int fclose_override(FILE *stream) {
 }
 
 int fgetc_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fgetc);
@@ -220,20 +239,20 @@ int fgetc_override(FILE *stream) {
         return EOF;
     }
     
-    unsigned char c;
+    char c;
     size_t bytes_read = cookie->funcs.read(cookie->cookie, &c, 1);
     
-    if (bytes_read == 0) {
+    if (bytes_read <= 0) {
         cookie->eof_flag = 1;
         return EOF;
     }
     
     cookie->position++;
-    return (int)c;
+    return (int)(unsigned char)c;
 }
 
 int fputc_override(int c, FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fputc);
@@ -246,7 +265,7 @@ int fputc_override(int c, FILE *stream) {
         return EOF;
     }
     
-    unsigned char ch = (unsigned char)c;
+    char ch = (char)c;
     size_t bytes_written = cookie->funcs.write(cookie->cookie, &ch, 1);
     
     if (bytes_written != 1) {
@@ -259,7 +278,7 @@ int fputc_override(int c, FILE *stream) {
 }
 
 char* fgets_override(char *s, int size, FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fgets);
@@ -274,10 +293,10 @@ char* fgets_override(char *s, int size, FILE *stream) {
     
     int i = 0;
     while (i < size - 1) {
-        unsigned char c;
+        char c;
         size_t bytes_read = cookie->funcs.read(cookie->cookie, &c, 1);
         
-        if (bytes_read == 0) {
+        if (bytes_read <= 0) {
             cookie->eof_flag = 1;
             break;
         }
@@ -299,7 +318,7 @@ char* fgets_override(char *s, int size, FILE *stream) {
 }
 
 int fputs_override(const char *s, FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fputs);
@@ -315,7 +334,7 @@ int fputs_override(const char *s, FILE *stream) {
     size_t len = strlen(s);
     size_t bytes_written = cookie->funcs.write(cookie->cookie, s, len);
     
-    if (bytes_written != len) {
+    if (bytes_written != (size_t)len) {
         cookie->error_flag = 1;
         return EOF;
     }
@@ -327,7 +346,7 @@ int fputs_override(const char *s, FILE *stream) {
 #define TEMP_BUFFER_SIZE 4096
 
 int fprintf_override(FILE *stream, const char *format, ...) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     va_list args;
     va_start(args, format);
@@ -345,7 +364,7 @@ int fprintf_override(FILE *stream, const char *format, ...) {
         return -1;
     }
     
-    char *buffer = malloc(TEMP_BUFFER_SIZE);
+    char *buffer = (char*)malloc(TEMP_BUFFER_SIZE);
     if (!buffer) {
         va_end(args);
         return -1;
@@ -361,7 +380,7 @@ int fprintf_override(FILE *stream, const char *format, ...) {
     
     if (len >= TEMP_BUFFER_SIZE) {
         free(buffer);
-        buffer = malloc(len + 1);
+        buffer = (char*)malloc(len + 1);
         if (!buffer) {
             return -1;
         }
@@ -379,7 +398,7 @@ int fprintf_override(FILE *stream, const char *format, ...) {
     size_t bytes_written = cookie->funcs.write(cookie->cookie, buffer, len);
     free(buffer);
     
-    if (bytes_written != (size_t)len) {
+    if (bytes_written != len) {
         cookie->error_flag = 1;
         return -1;
     }
@@ -389,7 +408,7 @@ int fprintf_override(FILE *stream, const char *format, ...) {
 }
 
 int fscanf_override(FILE *stream, const char *format, ...) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         va_list args;
@@ -401,7 +420,7 @@ int fscanf_override(FILE *stream, const char *format, ...) {
         return result;
     }
     
-    char *buffer = malloc(TEMP_BUFFER_SIZE);
+    char *buffer = (char*)malloc(TEMP_BUFFER_SIZE);
     if (!buffer) {
         return EOF;
     }
@@ -411,18 +430,18 @@ int fscanf_override(FILE *stream, const char *format, ...) {
     
     while (1) {
         size_t bytes_read = cookie->funcs.read(cookie->cookie, 
-                                             buffer + total_read, 
-                                             buffer_size - total_read - 1);
+                                               buffer + total_read, 
+                                               buffer_size - total_read - 1);
         
-        if (bytes_read == 0) {
+        if (bytes_read <= 0) {
             break;
         }
         
-        total_read += bytes_read;
+        total_read += (size_t)bytes_read;
         
         if (total_read >= buffer_size - 1) {
             buffer_size *= 2;
-            char *new_buffer = realloc(buffer, buffer_size);
+            char *new_buffer = (char*)realloc(buffer, buffer_size);
             if (!new_buffer) {
                 free(buffer);
                 return EOF;
@@ -443,7 +462,7 @@ int fscanf_override(FILE *stream, const char *format, ...) {
 }
 
 int fflush_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fflush);
@@ -451,12 +470,12 @@ int fflush_override(FILE *stream) {
         MH_EnableHook(&fflush);
         return result;
     }
-    // no op
+    // no op 
     return 0;
 }
 
 int feof_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&feof);
@@ -469,7 +488,7 @@ int feof_override(FILE *stream) {
 }
 
 int ferror_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&ferror);
@@ -482,7 +501,7 @@ int ferror_override(FILE *stream) {
 }
 
 void clearerr_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&clearerr);
@@ -496,7 +515,7 @@ void clearerr_override(FILE *stream) {
 }
 
 void rewind_override(FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&rewind);
@@ -506,7 +525,7 @@ void rewind_override(FILE *stream) {
     }
     
     long offset = 0;
-    if (cookie->funcs.seek(cookie->cookie, offset, SEEK_SET) == 0) {
+    if (cookie->funcs.seek(cookie->cookie, &offset, SEEK_SET) == 0) {
         cookie->position = 0;
         cookie->eof_flag = 0;
         cookie->error_flag = 0;
@@ -514,7 +533,7 @@ void rewind_override(FILE *stream) {
 }
 
 int fsetpos_override(FILE *stream, const fpos_t *pos) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fsetpos);
@@ -524,7 +543,7 @@ int fsetpos_override(FILE *stream, const fpos_t *pos) {
     }
     
     long offset = (long)*pos;
-    int result = cookie->funcs.seek(cookie->cookie, offset, SEEK_SET);
+    int result = cookie->funcs.seek(cookie->cookie, &offset, SEEK_SET);
     
     if (result == 0) {
         cookie->position = offset;
@@ -535,7 +554,7 @@ int fsetpos_override(FILE *stream, const fpos_t *pos) {
 }
 
 int fgetpos_override(FILE *stream, fpos_t *pos) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&fgetpos);
@@ -549,7 +568,7 @@ int fgetpos_override(FILE *stream, fpos_t *pos) {
 }
 
 int ungetc_override(int c, FILE *stream) {
-    _IO_cookie_t* cookie = find_cookie(stream);
+    cookie_t* cookie = find_cookie(stream);
     
     if (!cookie) {
         MH_DisableHook(&ungetc);
@@ -560,7 +579,7 @@ int ungetc_override(int c, FILE *stream) {
     
     if (cookie->position > 0) {
         long offset = cookie->position - 1;
-        if (cookie->funcs.seek(cookie->cookie, offset, SEEK_SET) == 0) {
+        if (cookie->funcs.seek(cookie->cookie, &offset, SEEK_SET) == 0) {
             cookie->position--;
             cookie->eof_flag = 0;
             return c;
@@ -570,69 +589,81 @@ int ungetc_override(int c, FILE *stream) {
     return EOF;
 }
 
-void setup_hooks(void) {
+int setup_hooks(void) {
     if (hooks_initialized) {
-        return;
+        return 0;
     }
     
-    MH_Initialize();
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK) {
+        return -1;
+    }
     
-    MH_CreateHook(&fread, fread_override, (LPVOID*)&originalfread);
-    MH_CreateHook(&fwrite, fwrite_override, (LPVOID*)&originalfwrite);
-    MH_CreateHook(&fseek, fseek_override, (LPVOID*)&originalfseek);
-    MH_CreateHook(&ftell, ftell_override, (LPVOID*)&originalftell);
-    MH_CreateHook(&fclose, fclose_override, (LPVOID*)&originalfclose);
-    MH_CreateHook(&fgetc, fgetc_override, (LPVOID*)&originalfgetc);
-    MH_CreateHook(&fputc, fputc_override, (LPVOID*)&originalfputc);
-    MH_CreateHook(&fgets, fgets_override, (LPVOID*)&originalfgets);
-    MH_CreateHook(&fputs, fputs_override, (LPVOID*)&originalfputs);
-    //MH_CreateHook(&fprintf, fprintf_override, (LPVOID*)&originalfprintf); -> does not work, so macros instead.
-    MH_CreateHook(&fscanf, fscanf_override, (LPVOID*)&originalfscanf);
-    MH_CreateHook(&fflush, fflush_override, (LPVOID*)&originalfflush);
-    MH_CreateHook(&feof, feof_override, (LPVOID*)&originalfeof);
-    MH_CreateHook(&ferror, ferror_override, (LPVOID*)&originalferror);
-    MH_CreateHook(&clearerr, clearerr_override, (LPVOID*)&originalclearerr);
-    MH_CreateHook(&rewind, rewind_override, (LPVOID*)&originalrewind);
-    MH_CreateHook(&fsetpos, fsetpos_override, (LPVOID*)&originalfsetpos);
-    MH_CreateHook(&fgetpos, fgetpos_override, (LPVOID*)&originalfgetpos);
-    MH_CreateHook(&ungetc, ungetc_override, (LPVOID*)&originalungetc);
+    #define CREATE_HOOK(func) \
+        if (MH_CreateHook(&func, func##_override, (LPVOID*)&original_##func) != MH_OK) { \
+            goto cleanup_hooks; \
+        }
     
-    MH_EnableHook(&fread);
-    MH_EnableHook(&fwrite);
-    MH_EnableHook(&fseek);
-    MH_EnableHook(&ftell);
-    MH_EnableHook(&fclose);
-    MH_EnableHook(&fgetc);
-    MH_EnableHook(&fputc);
-    MH_EnableHook(&fgets);
-    MH_EnableHook(&fputs);
-    //MH_EnableHook(&fprintf); -> does not work, so macros instead.
-    MH_EnableHook(&fscanf);
-    MH_EnableHook(&fflush);
-    MH_EnableHook(&feof);
-    MH_EnableHook(&ferror);
-    MH_EnableHook(&clearerr);
-    MH_EnableHook(&rewind);
-    MH_EnableHook(&fsetpos);
-    MH_EnableHook(&fgetpos);
-    MH_EnableHook(&ungetc);
+    CREATE_HOOK(fread);
+    CREATE_HOOK(fwrite);
+    CREATE_HOOK(fseek);
+    CREATE_HOOK(ftell);
+    CREATE_HOOK(fclose);
+    CREATE_HOOK(fgetc);
+    CREATE_HOOK(fputc);
+    CREATE_HOOK(fgets);
+    CREATE_HOOK(fputs);
+    CREATE_HOOK(fscanf);
+    CREATE_HOOK(fflush);
+    CREATE_HOOK(feof);
+    CREATE_HOOK(ferror);
+    CREATE_HOOK(clearerr);
+    CREATE_HOOK(rewind);
+    CREATE_HOOK(fsetpos);
+    CREATE_HOOK(fgetpos);
+    CREATE_HOOK(ungetc);
+    
+    // Enable all hooks
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        goto cleanup_hooks;
+    }
     
     hooks_initialized = 1;
+    return 0;
+    
+cleanup_hooks:
+    MH_Uninitialize();
+    return -1;
+}
+
+unsigned int get_mode(FILE* stream) {
+    cookie_t* cookie = find_cookie(stream);
+    if (!cookie) {
+        errno = EBADF;
+        return (unsigned int)-1;
+    }
+    return cookie->flags;
 }
 
 FILE* win_fopencookie
 (
-    void*             cookie_data,
+    void* restrict        cookie_data,
     
-    //const char *restrict mode, TODO
+    const char* restrict mode,
 
     cookie_io_functions_t io_funcs
 )
 {
     setup_hooks();
     
-    _IO_cookie_t* cookie = malloc(sizeof(_IO_cookie_t));
+    if (!mode) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    cookie_t* cookie = malloc(sizeof(cookie_t));
     if (!cookie) {
+        errno = ENOMEM;
         return NULL;
     }
     
@@ -645,8 +676,56 @@ FILE* win_fopencookie
     cookie->error_flag = 0;
     cookie->position = 0;
     
+
+    switch (mode[0]) 
+    {
+        case 'r':
+            cookie->flags = (mode[1] == '+') ? O_RDWR : O_RDONLY;
+            break;
+        case 'w':
+            cookie->flags = (mode[1] == '+') ? (O_RDWR | O_CREAT | O_TRUNC) : (O_WRONLY | O_CREAT | O_TRUNC);
+            break;
+        case 'a':
+            cookie->flags = (mode[1] == '+') ? (O_RDWR | O_CREAT | O_APPEND) : (O_WRONLY | O_CREAT | O_APPEND);
+            break;
+        default:
+            free(cookie);
+            errno = EINVAL;
+            return NULL;
+    }
+
+    if ((cookie->flags & O_RDONLY) && !cookie->funcs.read) {
+        free(cookie);
+        errno = EBADF;
+        return NULL;
+    }
+    if ((cookie->flags & O_WRONLY) && !cookie->funcs.write) {
+        free(cookie);
+        errno = EBADF;
+        return NULL;
+    }
+    if ((cookie->flags & O_RDWR) &&
+        (!cookie->funcs.read || !cookie->funcs.write)) {
+        free(cookie);
+        errno = EBADF;
+        return NULL;
+    }
+
+    if ((cookie->flags & O_APPEND) && !cookie->funcs.seek) {
+        free(cookie);
+        errno = ESPIPE;
+        return NULL;
+    }
+
     FILE* f = (FILE*)cookie;
     
+
+    if (cookie->flags & O_APPEND) {
+        long end_pos = 0;
+        cookie->funcs.seek(cookie->cookie, &end_pos, SEEK_END);
+        cookie->position = end_pos;
+    }
+
     register_cookie(cookie, f);
     return f;
 }

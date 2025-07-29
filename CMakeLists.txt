@@ -6,23 +6,37 @@ set(MGLIB_MINOR_VERSION 0)
 set(MGLIB_PATCH_VERSION 0)
 set(MGLIB_VERSION ${MGLIB_MAJOR_VERSION}.${MGLIB_MINOR_VERSION}.${MGLIB_PATCH_VERSION})
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+enable_testing()
 
 add_subdirectory(minhook)
 
-set(MY_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/cookie_test.c
+set(COMMON_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/fopencookie.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fmemopen.c
 )
 
-add_executable(cookie_test ${MY_SRC})
+add_executable(mem_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/mem_test.c
+    ${COMMON_SRC}
+)
+target_include_directories(mem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
+target_link_libraries(mem_test PRIVATE kernel32 user32 minhook)
 
+add_executable(cookie_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/cookie_test.c
+    ${COMMON_SRC}
+)
 target_include_directories(cookie_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
-
 target_link_libraries(cookie_test PRIVATE kernel32 user32 minhook)
 
+add_test(NAME mem_test COMMAND $<TARGET_FILE:mem_test>)
+add_test(NAME cookie_test COMMAND $<TARGET_FILE:cookie_test>)
+
 if(MINGW)
+    target_link_options(mem_test PRIVATE -mconsole)
     target_link_options(cookie_test PRIVATE -mconsole)
 endif()
